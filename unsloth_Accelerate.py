@@ -340,4 +340,7 @@ def main():
             print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving LoRA adapters and tokenizer...", flush=True)
             trainer.model.save_pretrained(str(lora_save_path))
             tokenizer.save_pretrained(str(lora_save_path))
-            #print(f"[PID {pid}, Rank {rank_idx}] MAIN
+            #print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: LoRA adapters and tokenizer saved.", flush=True)
+        except Exception as e_train:
+            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during training: {e_train}", flush=True)
+            raise
