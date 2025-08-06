@@ -344,3 +344,28 @@ def main():
         except Exception as e_train:
             print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during training: {e_train}", flush=True)
             raise
+
+if __name__ == "__main__":
+    main_pid = os.getpid()
+    print(f"[PID {main_pid}] Script __main__ started.", flush=True)
+    try:
+        results = main()
+        # This final print will only be from processes that complete main()
+        # The Accelerator object in main() goes out of scope.
+        # For a final status, rely on the prints from within main() and accelerator's handling of processes.
+        # If we need a global "all done" from main rank:
+        try:
+            temp_accelerator_check = Accelerator() # Create a new one just for this check
+            if temp_accelerator_check.is_main_process:
+                print(f"[PID {main_pid}, MainRank] __main__: Training complete. Metrics: {results}", flush=True)
+            # The temp_accelerator_check will clean up when it goes out of scope
+        except Exception as e_temp_accel:
+             print(f"⚠️ [PID {main_pid}] Could not create temp accelerator for final print: {e_temp_accel}", flush=True)
+
+    except Exception as e_main_fatal:
+        print(f"🔥🔥🔥 [PID {main_pid}] FATAL ERROR in __main__ execution: {e_main_fatal}", flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        sys.exit(1) # Ensure non-zero exit code for accelerate
+    print(f"[PID {main_pid}] Script __main__ exiting normally.", flush=True)
