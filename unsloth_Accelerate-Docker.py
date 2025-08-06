@@ -1,41 +1,40 @@
 #!/usr/bin/env python
-import os
-import sys # For flushing output
-import gc
+# Parts 1 & 2: Combined from previous responses and your script
+# Includes: Initial setup, imports, config, model/LoRA/dataset loading functions, main() up to dataset formatting.
 
-# --- Patch Huggingface’s HfFileSystem.glob to handle local paths for docker ---
+import os
+import sys
+import gc
 import glob
 from huggingface_hub.hf_file_system import HfFileSystem
+from accelerate import Accelerator
+# Use FastLanguageModel for standard Unsloth usage
+from unsloth import FastLanguageModel
+from datasets import load_dataset
+from trl import SFTTrainer, SFTConfig
+from huggingface_hub import login
+from transformers import TextStreamer
+import torch
 
+# --- Patch HfFileSystem.glob ---
 _orig_glob = HfFileSystem.glob
 def _glob_override(self, pattern, *args, **kwargs):
-    # strip file:// scheme and use Python glob
     if pattern.startswith("file://"):
         return glob.glob(pattern[len("file://"):])
-    # absolute paths on disk (e.g. "/app/models/Qwen3-32B/*.json")
-    # Also handle relative paths starting with './' or '../' implicitly
-    # by letting glob handle them relative to current PWD
     if os.path.isabs(pattern) or pattern.startswith('./') or pattern.startswith('../') or '/' in pattern:
-         # Add a check for explicit local paths that might not be absolute but are intended as such
          if os.path.exists(pattern) or '*' in pattern or '?' in pattern or '[' in pattern:
              return glob.glob(pattern)
-    # otherwise, fall back to HF’s original behavior
     return _orig_glob(self, pattern, *args, **kwargs)
-
 HfFileSystem.glob = _glob_override
 print("[PID {}] Patched HfFileSystem.glob for local paths.".format(os.getpid()), flush=True)
 
-# --- Critical Environment Variables (set BEFORE torch import) ---
+# --- Critical Environment Variables ---
 os.environ["TORCH_DISTRIBUTED_USE_DTENSOR"] = "0"
 os.environ["TORCH_DIST_DDP_SHARDING"] = "0"
 os.environ["ACCELERATE_USE_TP"] = "false"
 os.environ["PYTORCH_ENABLE_DISTRIBUTED"] = "1"
-os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL" # Already set
-os.environ["NCCL_DEBUG"] = "INFO" # Set to WARN or INFO
-# For more verbose NCCL, uncomment next line. Can be very noisy.
-# os.environ["NCCL_DEBUG_SUBSYS"] = "ALL"
-# For CUDA errors, makes them synchronous. Slows things down significantly. Use if suspecting CUDA misbehavior.
-# os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
+os.environ["NCCL_DEBUG"] = "INFO"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TORCH_COMPILE_DISABLE"] = "1"
 os.environ["TORCHINDUCTOR_DISABLE"] = "1"
@@ -49,7 +48,6 @@ print(f"[PID {os.getpid()}] Current PWD: {os.getcwd()}", flush=True)
 print(f"[PID {os.getpid()}] TORCH_DISTRIBUTED_USE_DTENSOR: {os.environ.get('TORCH_DISTRIBUTED_USE_DTENSOR')}", flush=True)
 print(f"[PID {os.getpid()}] CUDA_VISIBLE_DEVICES (from env): {os.environ.get('CUDA_VISIBLE_DEVICES')}", flush=True)
 print(f"[PID {os.getpid()}] ACCELERATE_USE_TP: {os.environ.get('ACCELERATE_USE_TP')}", flush=True)
-# RANK, LOCAL_RANK etc are set by accelerate launcher
 LAUNCHER_RANK = os.environ.get('RANK', 'N/A_LAUNCHER_RANK')
 LAUNCHER_LOCAL_RANK = os.environ.get('LOCAL_RANK', 'N/A_LOCAL_RANK')
 LAUNCHER_WORLD_SIZE = os.environ.get('WORLD_SIZE', 'N/A_WORLD_SIZE')
@@ -60,39 +58,24 @@ import torch
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Imported torch. Version: {torch.__version__}. CUDA available: {torch.cuda.is_available()}", flush=True)
 if torch.cuda.is_available():
     print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] CUDA device count: {torch.cuda.device_count()}", flush=True)
-    # Note: LOCAL_RANK might not be the final device index if CUDA_VISIBLE_DEVICES is used to remap.
-    # torch.cuda.current_device() will give the actual device index relative to the process.
     try:
-        # This will be the actual GPU index for this process (e.g., 0, 1, 2 if CUDA_VISIBLE_DEVICES was "0,1,2")
-        # Or just 0 if CUDA_VISIBLE_DEVICES was e.g. "2" for a specific process.
-        # This depends on how accelerate sets CUDA_VISIBLE_DEVICES for each process.
-        # Typically, each process sees its assigned GPU as device 0.
         if LAUNCHER_LOCAL_RANK != 'N/A_LOCAL_RANK' and int(LAUNCHER_LOCAL_RANK) < torch.cuda.device_count():
-            # This assumes accelerate makes each process see its assigned GPU as cuda:0
-            # Let's verify this understanding
             print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Current CUDA device (by torch.cuda.current_device()): {torch.cuda.current_device()}", flush=True)
             print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Name of current CUDA device: {torch.cuda.get_device_name(torch.cuda.current_device())}", flush=True)
         else:
-             print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] LOCAL_RANK ({LAUNCHER_LOCAL_RANK}) not valid for device_count check, or CUDA not fully initialized by accelerate yet for this print.", flush=True)
-
+             print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] LOCAL_RANK check skipped.", flush=True)
     except Exception as e_cuda_print:
         print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Error printing CUDA device info early: {e_cuda_print}", flush=True)
-
 
 # AGGRESSIVE DTENSOR PATCH
 try:
     from torch.distributed.tensor import DTensor
-    if hasattr(DTensor, "_op_dispatcher") and \
-       hasattr(DTensor._op_dispatcher.sharding_propagator) and \
-       hasattr(DTensor._op_dispatcher.sharding_propagator, "propagate"):
-
+    if hasattr(DTensor, "_op_dispatcher") and hasattr(DTensor._op_dispatcher.sharding_propagator) and hasattr(DTensor._op_dispatcher.sharding_propagator, "propagate"):
         original_propagate = DTensor._op_dispatcher.sharding_propagator.propagate
-        def _no_op_propagate(self_sharding_prop, op_info, *args, **kwargs): # op_info is the OpInfo object
-            # print(f"[PID {os.getpid()}, Rank {os.environ.get('RANK', 'N/A')}] DTensor _no_op_propagate called for op: {op_info.schema.name}", flush=True)
-            return op_info.output_sharding # Pass through, returning the default/expected output_sharding
-
+        def _no_op_propagate(self_sharding_prop, op_info, *args, **kwargs):
+            return op_info.output_sharding
         DTensor._op_dispatcher.sharding_propagator.propagate = _no_op_propagate
-        print(f"✅ [PID {os.getpid()}, Rank {LAUNCHER_RANK}] Successfully patched DTensor._op_dispatcher.sharding_propagator.propagate.", flush=True)
+        print(f"✅ [PID {os.getpid()}, Rank {LAUNCHER_RANK}] Successfully patched DTensor propagate.", flush=True)
     else:
         print(f"⚠️ [PID {os.getpid()}, Rank {LAUNCHER_RANK}] Could not find DTensor attributes for patching.", flush=True)
 except ImportError:
@@ -101,58 +84,77 @@ except Exception as e:
     print(f"⚠️ [PID {os.getpid()}, Rank {LAUNCHER_RANK}] Error during DTensor patching: {e}", flush=True)
 
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Importing accelerate...", flush=True)
-from accelerate import Accelerator
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Imported accelerate.", flush=True)
-
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Importing Unsloth...", flush=True)
-from unsloth import FastLanguageModel
-from unsloth.chat_templates import get_chat_template, standardize_sharegpt
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Imported Unsloth.", flush=True)
-
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Importing Transformers & Datasets...", flush=True)
-from transformers import TrainingArguments
-from datasets import load_dataset
-from trl import SFTTrainer
 print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Imported Transformers & Datasets.", flush=True)
 
-# Update MODEL_PATH to the path inside the container where you mounted it
-# then turn it into a file:// URI so HfFileSystem treats it as local FS
-MODEL_PATH = "/app/models/Qwen3-32B"
-MAX_SEQ_LENGTH = int(os.getenv("UNSLOTH_MAX_SEQ", 8192))
-LORA_R = 16
+# --- Hugging Face Login ---
+hf_token = os.environ.get("HF_TOKEN")
+if hf_token:
+    login(token=hf_token)
+    print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Logged into Hugging Face.", flush=True)
+else:
+    print(f"[PID {os.getpid()}, Rank {LAUNCHER_RANK}] Warning: HF_TOKEN not set.", flush=True)
+
+# --- Configuration matching your script ---
+MODEL_NAME = "unsloth/Qwen3-Coder-30B-A3B-Instruct"
+MAX_SEQ_LENGTH = 40960
+LOAD_IN_4BIT = True
+LOAD_IN_8BIT = False
+FULL_FINETUNING = True
+
+LORA_R = 32
 LORA_TARGET_MODULES = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-LORA_ALPHA = 16
-LORA_DROPOUT = 0.0
-# Update LOCAL_JSONL to the path inside the container where you mounted it
-LOCAL_JSONL = "/app/data/unsloth_datasets/qwen_combined_valid_prompts.jsonl"
-TEST_SPLIT_RATIO = 0.1238
-BATCH_SIZE = 1
-GRADIENT_ACCUMULATION_STEPS = 1
+LORA_ALPHA = 32
+LORA_DROPOUT = 0
+LORA_BIAS = "none"
+USE_GRADIENT_CHECKPOINTING = "unsloth"
+LORA_RANDOM_STATE = 3407
+USE_RSLORA = False
+LOFTQ_CONFIG = None
+
+DATASET_NAME = "LarsVI/botw_finetune1_with_val"
+
+PER_DEVICE_TRAIN_BATCH_SIZE = 2
+GRADIENT_ACCUMULATION_STEPS = 4
+WARMUP_STEPS = 5
 MAX_STEPS = 30
 LEARNING_RATE = 2e-4
+OPTIM = "adamw_8bit"
+WEIGHT_DECAY = 0.01
+LR_SCHEDULER_TYPE = "linear"
+SEED = 3407
+REPORT_TO = "wandb"
+
+# --- Chat Template (Copied from your script) ---
+# The QWEN_CHAT_TEMPLATE string is very long. Please ensure it is correctly copied
+# from your script into this location in the final file.
+QWEN_CHAT_TEMPLATE = r"""{% macro render_item_list(item_list, tag_name='required') %}\n    {%- if item_list is defined and item_list is iterable and item_list | length > 0 %}\n        {%- if tag_name %}{{- '\\n<' ~ tag_name ~ '>' -}}{% endif %}\n            {{- '[' }}\n                {%- for item in item_list -%}\n                    {%- if loop.index > 1 %}{{- \", \"}}{% endif -%}\n                    {%- if item is string -%}\n                        {{ \"`\" ~ item ~ \"`\" }}\n                    {%- else -%}\n                        {{ item }}\n                    {%- endif -%}\n                {%- endfor -%}\n            {{- ']' }}\n        {%- if tag_name %}{{- '</' ~ tag_name ~ '>' -}}{% endif %}\n    {%- endif %}\n{% endmacro %}\n\n{%- if messages[0][\"role\"] == \"system\" %}\n    {%- set system_message = messages[0][\"content\"] %}\n    {%- set loop_messages = messages[1:] %}\n{%- else %}\n    {%- set loop_messages = messages %}\n{%- endif %}\n\n{%- if not tools is defined %}\n    {%- set tools = [] %}\n{%- endif %}\n\n{%- if system_message is defined %}\n    {{- \"<|im_start|>system\\n\" + system_message }}\n{%- else %}\n    {%- if tools is iterable and tools | length > 0 %}\n        {{- \"<|im_start|>system\\nYou are Qwen, a helpful AI assistant that can interact with a computer to solve tasks.\" }}\n    {%- endif %}\n{%- endif %}\n{%- if tools is iterable and tools | length > 0 %}\n    {{- \"\\n\\nYou have access to the following functions:\\n\\n\" }}\n    {{- \"<tools>\" }}\n    {%- for tool in tools %}\n        {%- if tool.function is defined %}\n            {%- set tool = tool.function %}\n        {%- endif %}\n        {{- \"\\n<function>\\n<name>\" ~ tool.name ~ \"</name>\" }}\n        {{- '\\n<description>' ~ (tool.description | trim) ~ '</description>' }}\n        {{- '\\n<parameters>' }}\n        {%- for param_name, param_fields in tool.parameters.properties|items %}\n            {{- '\\n<parameter>' }}\n            {{- '\\n<name>' ~ param_name ~ '</name>' }}\n            {%- if param_fields.type is defined %}\n                {{- '\\n<type>' ~ (param_fields.type | string) ~ '</type>' }}\n            {%- endif %}\n            {%- if param_fields.description is defined %}\n                {{- '\\n<description>' ~ (param_fields.description | trim) ~ '</description>' }}\n            {%- endif %}\n            {{- render_item_list(param_fields.enum, 'enum') }}\n            {%- set handled_keys = ['type', 'description', 'enum', 'required'] %}\n            {%- for json_key in param_fields.keys() | reject(\"in\", handled_keys) %}\n                {%- set normed_json_key = json_key | replace(\"-\", \"_\") | replace(\" \", \"_\") | replace(\"$\", \"\") %}\n                {%- if param_fields[json_key] is mapping %}\n                    {{- '\\n<' ~ normed_json_key ~ '>' ~ (param_fields[json_key] | tojson | safe) ~ '</' ~ normed_json_key ~ '>' }}\n                {%- else %}\n                    {{-'\\n<' ~ normed_json_key ~ '>' ~ (param_fields[json_key] | string) ~ '</' ~ normed_json_key ~ '>' }}\n                {%- endif %}\n            {%- endfor %}\n            {{- render_item_list(param_fields.required, 'required') }}\n            {{- '\\n</parameter>' }}\n        {%- endfor %}\n        {{- render_item_list(tool.parameters.required, 'required') }}\n        {{- '\\n</parameters>' }}\n        {%- if tool.return is defined %}\n            {%- if tool.return is mapping %}\n                {{- '\\n<return>' ~ (tool.return | tojson | safe) ~ '</return>' }}\n            {%- else %}\n                {{- '\\n<return>' ~ (tool.return | string) ~ '</return>' }}\n            {%- endif %}\n        {%- endif %}\n        {{- '\\n</function>' }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n{%- endif %}\n{%- if system_message is defined %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if tools is iterable and tools | length > 0 %}\n        {{- '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- for message in loop_messages %}\n    {%- if message.role == \"assistant\" and message.tool_calls is defined and message.tool_calls is iterable and message.tool_calls | length > 0 %}\n        {{- '<|im_start|>' + message.role }}\n        {%- if message.content is defined and message.content is string and message.content | trim | length > 0 %}\n            {{- '\\n' + message.content | trim + '\\n' }}\n        {%- endif %}\n        {%- for tool_call in message.tool_calls %}\n            {%- if tool_call.function is defined %}\n                {%- set tool_call = tool_call.function %}\n            {%- endif %}\n            {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n            {%- if tool_call.arguments is defined %}\n                {%- for args_name, args_value in tool_call.arguments|items %}\n                    {{- '<parameter=' + args_name + '>\\n' }}\n                    {%- set args_value = args_value if args_value is string else args_value | string %}\n                    {{- args_value }}\n                    {{- '\\n</parameter>\\n' }}\n                {%- endfor %}\n            {%- endif %}\n            {{- '</function>\\n</tool_call>' }}\n        {%- endfor %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"user\" or message.role == \"system\" or message.role == \"assistant\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user\\n' }}\n        {%- endif %}\n        {{- '<tool_response>\\n' }}\n        {{- message.content }}\n        {{- '\\n</tool_response>\\n' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- '<|im_start|>' + message.role + '\\n' + message.content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n{%- endif %}\n"""
+
+# --- Format Function (Copied from your script) ---
+
 
 # --- Model Loading ---
 def load_model(current_accelerator):
     rank_idx = current_accelerator.process_index
     pid = os.getpid()
     print(f"[PID {pid}, Rank {rank_idx}] In load_model()...", flush=True)
-    LOAD_IN_4BIT = True
 
     device_map_config = {"": current_accelerator.device}
     print(f"[PID {pid}, Rank {rank_idx}] Using device_map: {device_map_config}", flush=True)
 
     model_kwargs = {
-        "model_name": MODEL_PATH,
+        "model_name": MODEL_NAME,
         "max_seq_length": MAX_SEQ_LENGTH,
         "load_in_4bit": LOAD_IN_4BIT,
         "attn_implementation": "flash_attention_2",
         "device_map": device_map_config,
-        # For Unsloth, 'dtype=torch.bfloat16' usually works well with load_in_4bit=True.
-        "dtype" : torch.bfloat16,
+        # Let Unsloth handle attn_implementation and dtype with 4bit loading
     }
 
     print(f"[PID {pid}, Rank {rank_idx}] model_kwargs: {model_kwargs}", flush=True)
-
 
     print(f"[PID {pid}, Rank {rank_idx}] Calling FastLanguageModel.from_pretrained...", flush=True)
     try:
@@ -179,11 +181,11 @@ def apply_lora(base_model, current_accelerator):
             target_modules=LORA_TARGET_MODULES,
             lora_alpha=LORA_ALPHA,
             lora_dropout=LORA_DROPOUT,
-            bias="none",
-            use_gradient_checkpointing="unsloth",
-            random_state=3407,
-            use_rslora=False,
-            loftq_config=None,
+            bias=LORA_BIAS,
+            use_gradient_checkpointing=USE_GRADIENT_CHECKPOINTING,
+            random_state=LORA_RANDOM_STATE,
+            use_rslora=USE_RSLORA,
+            loftq_config=LOFTQ_CONFIG,
         )
         print(f"[PID {pid}, Rank {rank_idx}] apply_lora successful.", flush=True)
         return lora_model
@@ -200,15 +202,12 @@ def load_and_split_dataset(current_accelerator):
     pid = os.getpid()
     print(f"[PID {pid}, Rank {rank_idx}] In load_and_split_dataset()...", flush=True)
     try:
-        # Ensure dataset loading happens on main process only if it's not safe for multiple processes
-        # or if it involves downloads. load_dataset is generally safe.
-        # with current_accelerator.main_process_first(): # Example if download/caching is an issue
-        #     ds = load_dataset("json", data_files={"train": LOCAL_JSONL})["train"]
-        # Use file:// scheme to hint HfFileSystem patch about local path
-        ds = load_dataset("json", data_files={"train": f"file://{LOCAL_JSONL}"}, trust_remote_code=True)["train"]
-        splits = ds.train_test_split(test_size=TEST_SPLIT_RATIO, seed=42)
-        print(f"[PID {pid}, Rank {rank_idx}] load_and_split_dataset successful.", flush=True)
-        return splits["train"], splits["test"]
+        with current_accelerator.main_process_first():
+             ds = load_dataset(DATASET_NAME, trust_remote_code=True)["train"]
+
+        print(f"[PID {pid}, Rank {rank_idx}] Dataset loaded successfully.", flush=True)
+        # Returning the same dataset for train/val as example. Adjust if needed.
+        return ds, ds
     except Exception as e_dsload:
         print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during load_and_split_dataset: {e_dsload}", flush=True)
         import traceback
@@ -218,12 +217,11 @@ def load_and_split_dataset(current_accelerator):
 
 # --- Main Function ---
 def main():
-    pid = os.getpid() # PID for prints before accelerator is fully initialized
+    pid = os.getpid()
     print(f"[PID {pid}, Pre-Accelerator-Rank] In main(). Initializing Accelerator...", flush=True)
-    # Initialize accelerator here
     accelerator = Accelerator()
-    rank_idx = accelerator.process_index # Now use accelerator's rank
-    print(f"[PID {pid}, Rank {rank_idx}] Accelerator initialized. Distributed: {accelerator.distributed_type}, Device: {accelerator.device}, Num_processes: {accelerator.num_processes}", flush=True)
+    rank_idx = accelerator.process_index
+    print(f"[PID {pid}, Rank {rank_idx}] Accelerator initialized.", flush=True)
 
     print(f"[PID {pid}, Rank {rank_idx}] Loading model and tokenizer...", flush=True)
     model, tokenizer = load_model(accelerator)
@@ -233,233 +231,170 @@ def main():
     model = apply_lora(model, accelerator)
     print(f"[PID {pid}, Rank {rank_idx}] LoRA applied.", flush=True)
 
-    print(f"[PID {pid}, Rank {rank_idx}] Loading and splitting dataset...", flush=True)
+    print(f"[PID {pid}, Rank {rank_idx}] Loading dataset...", flush=True)
     train_ds_raw, val_ds_raw = load_and_split_dataset(accelerator)
-    print(f"[PID {pid}, Rank {rank_idx}] Dataset loaded and split.", flush=True)
+    print(f"[PID {pid}, Rank {rank_idx}] Dataset loaded.", flush=True)
+
+    # --- Apply Chat Template ---
+    print(f"[PID {pid}, Rank {rank_idx}] Applying custom QWEN_CHAT_TEMPLATE...", flush=True)
+    # Ensure QWEN_CHAT_TEMPLATE is defined above
+    tokenizer.chat_template = QWEN_CHAT_TEMPLATE
+    print(f"[PID {pid}, Rank {rank_idx}] Custom QWEN_CHAT_TEMPLATE applied.", flush=True)
 
     if tokenizer.pad_token is None:
         print(f"[PID {pid}, Rank {rank_idx}] Setting pad_token to eos_token.", flush=True)
         tokenizer.pad_token = tokenizer.eos_token
-    if tokenizer.eos_token is None: # Should not happen for Qwen3
-        print(f"⚠️ [PID {pid}, Rank {rank_idx}] EOS token not set. Using default.", flush=True)
-        tokenizer.eos_token = "<|endoftext|>"
 
-    train_ds = train_ds_raw
-    val_ds = val_ds_raw
+    def format_with_official_template(examples):
+        texts = []
+        for messages in examples['messages']:
+            formatted = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=False # Important for training data formatting
+            )
+            texts.append(formatted)
+        return {"text": texts}
 
-    print(f"[PID {pid}, Rank {rank_idx}] Getting chat template...", flush=True)
-    #tokenizer = get_chat_template(
-    #    tokenizer,
-    #    chat_template="qwen3", # Qwen3 should be correct
-    #    mapping={"role": "from", "content": "value", "user": "human", "assistant": "gpt"}, # Check Unsloth docs for Qwen3 exact mapping
-    #)
-    if tokenizer.pad_token is None: # Re-check after get_chat_template
-        print(f"[PID {pid}, Rank {rank_idx}] Re-setting pad_token to eos_token post chat_template.", flush=True)
-        tokenizer.pad_token = tokenizer.eos_token
-    print(f"[PID {pid}, Rank {rank_idx}] Chat template applied.", flush=True)
+    # --- Format Datasets using the Template ---
+    print(f"[PID {pid}, Rank {rank_idx}] Formatting datasets with custom chat template...", flush=True)
+    with accelerator.main_process_first():
+        train_ds = train_ds_raw.map(format_with_official_template, batched=True, remove_columns=train_ds_raw.column_names)
+        val_ds = val_ds_raw.map(format_with_official_template, batched=True, remove_columns=val_ds_raw.column_names)
+    print(f"[PID {pid}, Rank {rank_idx}] Datasets formatted.", flush=True)
 
-    # Dataset mapping: Using fewer num_proc for debugging.
-    # Can be slow without num_proc, but safer for finding errors.
-    # Consider dataset_num_proc = 0 or 1 initially.
-    DATASET_MAP_NUM_PROC = 1 # Reduced for debugging
-    print(f"[PID {pid}, Rank {rank_idx}] Passing through train_ds text as-is (num_proc={DATASET_MAP_NUM_PROC})...", flush=True)
-    train_ds = train_ds.map(lambda ex: {"text": ex["text"]}, num_proc=DATASET_MAP_NUM_PROC, remove_columns=[col for col in train_ds.features if col != 'text'])
-
-    print(f"[PID {pid}, Rank {rank_idx}] Passing through val_ds text as-is (batched=True)...", flush=True)
-    val_ds = val_ds.map(lambda batch: {"text": batch["text"]}, batched=True, num_proc=DATASET_MAP_NUM_PROC, remove_columns=[col for col in val_ds.features if col != 'text'])
-
-    print(f"[PID {pid}, Rank {rank_idx}] Datasets processed.", flush=True)
-
-    training_args = TrainingArguments(
-        per_device_train_batch_size=BATCH_SIZE,
-        gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
-        warmup_steps=5,
-        max_steps=MAX_STEPS,
-        learning_rate=LEARNING_RATE,
-        logging_steps=1,
-        optim="adamw_8bit",
-        weight_decay=0.01,
-        lr_scheduler_type="linear",
-        seed=3407,
-        output_dir=os.path.join(OUTPUT_ROOT, "training_outputs"),
-        report_to="none",
-        gradient_checkpointing=True,
-        ddp_find_unused_parameters=False, # Usually False for LoRA with Unsloth
-        bf16=True,
-        fp16=False,
-    )
-    print(f"[PID {pid}, Rank {rank_idx}] TrainingArguments initialized.", flush=True)
-
-    print(f"[PID {pid}, Rank {rank_idx}] Initializing SFTTrainer...", flush=True)
-    # SFTTrainer's dataset_num_proc is for tokenization by the trainer
-    SFT_DATASET_NUM_PROC = 1 # Reduced for debugging
-    trainer = SFTTrainer(
-        model=model, # Accelerate will handle DDP wrapping internally via prepare()
-        tokenizer=tokenizer,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
-        dataset_text_field="text",
-        max_seq_length=MAX_SEQ_LENGTH,
-        dataset_num_proc=SFT_DATASET_NUM_PROC,
-        packing=False,
-        args=training_args,
-    )
-    print(f"[PID {pid}, Rank {rank_idx}] SFTTrainer initialized. Model is on: {trainer.model.device}", flush=True)
-
-    # Model might be DDP wrapped by SFTTrainer's __init__ (via accelerator.prepare)
-    # Access config on unwrapped model only for main process check
-    if accelerator.is_main_process:
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Pre-train check for model.config.use_cache.", flush=True)
-        unwrapped_model_for_config = accelerator.unwrap_model(trainer.model)
-        if hasattr(unwrapped_model_for_config, "config") and getattr(unwrapped_model_for_config.config, "use_cache", False):
-            print(f"✅ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing model.config.use_cache = False on unwrapped model.", flush=True)
-            unwrapped_model_for_config.config.use_cache = False
-            # Apply to the wrapped model as well if needed, although trainer should handle this
-            # if hasattr(trainer.model, "config"):
-            #     trainer.model.config.use_cache = False # This might not work on DDP object
-
-    # Wait for all processes to complete initialization and configuration before starting training
-    accelerator.wait_for_everyone()
-    print(f"[PID {pid}, Rank {rank_idx}] All processes ready. Calling trainer.train()...", flush=True)
-
+    # --- Training Arguments (SFTConfig) ---
+    print(f"[PID {pid}, Rank {rank_idx}] Initializing SFTConfig...", flush=True)
     try:
-        metrics = trainer.train()
-        print(f"[PID {pid}, Rank {rank_idx}] trainer.train() completed.", flush=True)
-    except Exception as e_train:
-        print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during trainer.train(): {e_train}", flush=True)
+        sft_config = SFTConfig(
+            dataset_text_field="text",
+            per_device_train_batch_size=PER_DEVICE_TRAIN_BATCH_SIZE,
+            gradient_accumulation_steps=GRADIENT_ACCUMULATION_STEPS,
+            warmup_steps=WARMUP_STEPS,
+            max_steps=MAX_STEPS,
+            learning_rate=LEARNING_RATE,
+            logging_steps=1,
+            optim=OPTIM,
+            weight_decay=WEIGHT_DECAY,
+            lr_scheduler_type=LR_SCHEDULER_TYPE,
+            seed=SEED,
+            output_dir=os.path.join(OUTPUT_ROOT, "training_outputs"),
+            report_to=REPORT_TO,
+        )
+        print(f"[PID {pid}, Rank {rank_idx}] SFTConfig initialized.", flush=True)
+    except Exception as e_config:
+        print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during SFTConfig initialization: {e_config}", flush=True)
         import traceback
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
-        sys.exit(1) # Exit the failing process
+        raise
 
-    # --- Critical: Wait for all processes to finish training BEFORE main process starts saving ---
-    # The error occurred here previously because Rank 0 started saving while others were waiting.
-    accelerator.wait_for_everyone()
-    print(f"[PID {pid}, Rank {rank_idx}] All processes finished training and synchronized.", flush=True)
+    # --- Trainer Setup ---
+    print(f"[PID {pid}, Rank {rank_idx}] Initializing SFTTrainer...", flush=True)
+    SFT_DATASET_NUM_PROC = 1
+    try:
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            args=sft_config,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            dataset_num_proc=SFT_DATASET_NUM_PROC,
+        )
+        print(f"[PID {pid}, Rank {rank_idx}] SFTTrainer initialized successfully.", flush=True)
+    except Exception as e_trainer:
+        print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during SFTTrainer initialization: {e_trainer}", flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        raise
 
-    # --- Saving logic moved AFTER the final barrier ---
+    # --- Model Configuration Check (Main Process Only) ---
     if accelerator.is_main_process:
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Training finished. Saving artifacts...", flush=True)
-        lora_adapter_path = os.path.join(OUTPUT_ROOT, "lora_adapters_final")
-        merged_model_16bit_path = os.path.join(OUTPUT_ROOT, "merged_model_16bit")
-        full_merged_model_path = os.path.join(OUTPUT_ROOT, "full_merged_model")
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Pre-train config check.", flush=True)
+        unwrapped_model_for_config = accelerator.unwrap_model(trainer.model)
+        if (hasattr(unwrapped_model_for_config, "config") and
+            hasattr(unwrapped_model_for_config.config, "use_cache") and
+            getattr(unwrapped_model_for_config.config, "use_cache", False)):
+            print(f"✅ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing model.config.use_cache = False.", flush=True)
+            unwrapped_model_for_config.config.use_cache = False
+    accelerator.wait_for_everyone()
+    print(f"[PID {pid}, Rank {rank_idx}] All processes synchronized before training.", flush=True)
 
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving LoRA adapters to {lora_adapter_path}...", flush=True)
-        # Save LoRA adapters from the trainer's model (which is the wrapped PEFT model)
+    # --- Training ---
+    print(f"[PID {pid}, Rank {rank_idx}] Starting training...", flush=True)
+    try:
+        trainer_stats = trainer.train()
+        print(f"[PID {pid}, Rank {rank_idx}] Training completed.", flush=True)
+        print(f"[PID {pid}, Rank {rank_idx}] Training Stats: {trainer_stats}", flush=True)
+    except Exception as e_train:
+        print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] ERROR during training: {e_train}", flush=True)
+        import traceback
+        traceback.print_exc(file=sys.stdout)
+        sys.stdout.flush()
+        raise
+
+    # --- Critical: Wait for ALL processes to finish training BEFORE main process starts saving ---
+    print(f"[PID {pid}, Rank {rank_idx}] Waiting for all processes to finish training...", flush=True)
+    accelerator.wait_for_everyone()
+    print(f"[PID {pid}, Rank {rank_idx}] All processes finished training and are synchronized.", flush=True)
+
+    # --- Saving the model (Main Process Only) ---
+    if accelerator.is_main_process:
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving training artifacts...", flush=True)
+        lora_save_path = os.path.join(OUTPUT_ROOT, "lora_model")
+
         try:
-            # PeftModel's save_pretrained can handle DDP wrapped models on the main process
-            trainer.model.save_pretrained(lora_adapter_path)
-            tokenizer.save_pretrained(lora_adapter_path)
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: LoRA adapters saved.", flush=True)
-        except Exception as e_lora_save:
-             print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Error saving LoRA adapters: {e_lora_save}", flush=True)
-             import traceback
-             traceback.print_exc(file=sys.stdout)
-             sys.stdout.flush()
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving LoRA adapters and tokenizer...", flush=True)
+            trainer.model.save_pretrained(lora_save_path)
+            tokenizer.save_pretrained(lora_save_path)
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: LoRA adapters and tokenizer saved successfully.", flush=True)
 
-        # --- Start of more aggressive VRAM clearing + original saving logic ---
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Preparing for full save. Unwrapping model...", flush=True)
-        unwrapped_model_for_save = accelerator.unwrap_model(trainer.model)
+            # --- Optional: Post-training Generation Test ---
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Running post-training generation test...", flush=True)
+            messages = [
+                {"role": "user", "content": "Solve (x + 2)^2 = 0."}
+            ]
+            test_text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True
+            )
+            inputs = tokenizer(test_text, return_tensors="pt").to(accelerator.device)
+            streamer = TextStreamer(tokenizer, skip_prompt=True)
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Generating response...", flush=True)
+            _ = model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.7,
+                top_p=0.8,
+                top_k=20,
+                streamer=streamer,
+            )
+            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Post-training generation test completed.", flush=True)
 
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Moving unwrapped model to CPU...", flush=True)
-        # This is the original step that might cause issues with Unsloth's fast_dequantize
-        try:
-            unwrapped_model_for_save = unwrapped_model_for_save.to("cpu")
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Unwrapped model moved to CPU.", flush=True)
-        except Exception as e_cpu_move:
-            print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Could not move unwrapped model to CPU: {e_cpu_move}", flush=True)
-            # Decide if this should be a fatal error or just a warning. Let's print and continue to merge/save attempt.
+        except Exception as e_save:
+            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: ERROR during saving or generation: {e_save}", flush=True)
             import traceback
             traceback.print_exc(file=sys.stdout)
             sys.stdout.flush()
 
+        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: All saving operations completed.", flush=True)
 
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing GC + emptying CUDA cache...", flush=True)
-        gc.collect()
-        torch.cuda.empty_cache()
-
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merging LoRA into base model (on CPU)...", flush=True)
-        try:
-            unwrapped_model_for_save.merge_and_unload()
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merge successful.", flush=True)
-        except Exception as e_merge:
-            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: ERROR during merge_and_unload on CPU: {e_merge}", flush=True)
-            import traceback
-            traceback.print_exc(file=sys.stdout)
-            sys.stdout.flush()
-            # Raise here as merging is critical
-            raise
-
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving merged 16-bit model to {merged_model_16bit_path}...", flush=True)
-        try:
-            unwrapped_model_for_save.save_pretrained_merged(merged_model_16bit_path, tokenizer, save_method="merged_16bit")
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Merged 16-bit model saved.", flush=True)
-        except Exception as e_save_16bit:
-             print(f"⚠️ [PID {pid}, Rank {rank_idx}] MAIN PROCESS: Error saving merged 16-bit model: {e_save_16bit}", flush=True)
-             import traceback
-             traceback.print_exc(file=sys.stdout)
-             sys.stdout.flush()
-
-
-        # Attempt the GGUF save using the original approach (save_pretrained after merge on CPU)
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Saving model to GGUF (from CPU copy) to {full_merged_model_path}...", flush=True)
-        try:
-            # This is the call that caused the 'fast_dequantize on CPU' warnings previously.
-            # Unsloth intercepts this call to perform GGUF conversion.
-            unwrapped_model_for_save.save_pretrained(full_merged_model_path)
-            tokenizer.save_pretrained(full_merged_model_path) # Save tokenizer alongside GGUF output
-            print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Model saved to GGUF via save_pretrained.", flush=True)
-        except Exception as e_gguf:
-            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: FATAL ERROR during GGUF save via save_pretrained: {e_gguf}", flush=True)
-            print(f"🔥🔥🔥 [PID {pid}, Rank {rank_idx}] MAIN PROCESS: This is the step that previously failed with 'fast_dequantize'. Check Unsloth/Torch/CUDA compatibility or try the save_pretrained_gguf method.", flush=True)
-            import traceback
-            traceback.print_exc(file=sys.stdout)
-            sys.stdout.flush()
-            # Allow script to potentially finish for other ranks' outputs, but exit with error
-            sys.exit(1)
-
-
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Deleting trainer and model references to free VRAM...", flush=True)
-        # These were already deleted conceptually earlier, but ensure they are gone.
-        # The unwrapped_model_for_save reference still exists, we should delete that too.
-        del trainer # Should be None or already deleted
-        del model   # Should be None or already deleted
-        del unwrapped_model_for_save # Delete the reference to the model on CPU
-        
-        print(f"[PID {pid}, Rank {rank_idx}] MAIN PROCESS: Forcing garbage collection and emptying CUDA cache... (Post-Save)", flush=True)
-        gc.collect()
-        torch.cuda.empty_cache()
-        # --- End of reverted saving logic ---
-
-    # No need for a final barrier after saving, as only the main process does it.
-    # The script will exit naturally.
-
+    print(f"[PID {pid}, Rank {rank_idx}] Finalizing Accelerator...", flush=True)
+    accelerator.end_training()
     print(f"[PID {pid}, Rank {rank_idx}] Script finished successfully for this process.", flush=True)
-    return metrics if 'metrics' in locals() else None
+
 if __name__ == "__main__":
     main_pid = os.getpid()
     print(f"[PID {main_pid}] Script __main__ started.", flush=True)
     try:
-        results = main()
-        # This final print will only be from processes that complete main()
-        # The Accelerator object in main() goes out of scope.
-        # For a final status, rely on the prints from within main() and accelerator's handling of processes.
-        # If we need a global "all done" from main rank:
-        try:
-            # Create a new one just for this check. This is safer than relying on the 'accelerator'
-            # variable from main() which might be partially de-initialized.
-            temp_accelerator_check = Accelerator()
-            if temp_accelerator_check.is_main_process:
-                print(f"[PID {main_pid}, MainRank] __main__: Training complete. Metrics: {results}", flush=True)
-            # The temp_accelerator_check will clean up when it goes out of scope
-        except Exception as e_temp_accel:
-             print(f"⚠️ [PID {main_pid}] Could not create temp accelerator for final print: {e_temp_accel}", flush=True)
-
-
-    except Exception as e_main_fatal:
-        print(f"🔥🔥🔥 [PID {main_pid}] FATAL ERROR in __main__ execution: {e_main_fatal}", flush=True)
+        main()
+        print(f"[PID {main_pid}] Script __main__ finished successfully.", flush=True)
+    except Exception as e_main:
+        print(f"🔥🔥🔥 [PID {main_pid}] FATAL ERROR in main execution: {e_main}", flush=True)
         import traceback
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
-        sys.exit(1) # Ensure non-zero exit code for accelerate
-    print(f"[PID {main_pid}] Script __main__ exiting normally.", flush=True)
+        sys.exit(1)
+    print(f"[PID {main_pid}] Script __main__ exiting.", flush=True)
